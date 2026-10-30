@@ -8,12 +8,17 @@ from streamlit_autorefresh import st_autorefresh
 
 APP_DIR=os.path.dirname(os.path.abspath(__file__))
 DB=os.path.join(APP_DIR,'data','paper_trading.db')
+os.makedirs(os.path.dirname(DB), exist_ok=True)
 DEFAULT_SYMBOLS='RELIANCE,TCS,INFY,HDFCBANK,ICICIBANK,SBIN,ITC,LT,AXISBANK,BAJFINANCE,TATAMOTORS,MARUTI,SUNPHARMA,TATASTEEL,ONGC,NTPC,POWERGRID,ADANIENT,COALINDIA,HINDALCO,JSWSTEEL,TECHM,WIPRO,HCLTECH,INDUSINDBK,ULTRACEMCO,ASIANPAINT,TITAN,GRASIM,NESTLEIND'
 
 def conn():
     c=sqlite3.connect(DB,check_same_thread=False)
     c.execute('''CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, entry REAL, stop REAL, target REAL, qty INTEGER, opened TEXT, status TEXT, exit REAL, closed TEXT, pnl REAL, reason TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, side TEXT, price REAL, time TEXT, reason TEXT, UNIQUE(symbol,side,time))''')
+    # Backward-compatible migration for existing V3 paper-trading databases.
+    columns={row[1] for row in c.execute('PRAGMA table_info(trades)').fetchall()}
+    if 'last_bar' not in columns:
+        c.execute('ALTER TABLE trades ADD COLUMN last_bar TEXT')
     c.commit(); return c
 
 def get_bars(symbol):
@@ -74,16 +79,34 @@ def scan(symbols, capital_risk, max_positions, max_trades, daily_profit, daily_l
             status.append({'Symbol':sym,'Status':'No data','Last price':None,'Signal':'—'}); continue
         price=float(df.Close.iloc[-1]); sig=evaluate(df); status.append({'Symbol':sym,'Status':'OK','Last price':round(price,2),'Signal':sig['side'] if sig else '—'})
         # Manage open paper trades on each scan, including stop/target checks.
-        current=c.execute('SELECT id,side,entry,stop,target,qty FROM trades WHERE symbol=? AND status="OPEN"',(sym,)).fetchall()
-        for tid,side,entry,stop,target,qty in current:
+        current=c.execute('SELECT id,side,entry,stop,target,qty,last_bar FROM trades WHERE symbol=? AND status="OPEN"',(sym,)).fetchall()
+        bar_time=str(df.index[-1])
+        ema9=float(df.Close.ewm(span=9,adjust=False).mean().iloc[-1])
+        # Small 0.10% buffer below/above the yellow 9 EMA to reduce noise-triggered exits.
+        buffer=ema9*0.001
+        for tid,side,entry,stop,target,qty,last_bar in current:
+            # Evaluate a completed candle only once. The newly trailed stop becomes
+            # active from the next completed candle, avoiding same-bar false hits.
+            if last_bar == bar_time:
+                continue
             last=df.iloc[-1]; exit_price=None; reason=''
-            if side=='BUY' and float(last.Low)<=stop: exit_price=stop; reason='Stop-loss'
+            if side=='BUY' and float(last.Low)<=stop: exit_price=stop; reason='Trailing/initial stop-loss'
             elif side=='BUY' and float(last.High)>=target: exit_price=target; reason='Target'
-            elif side=='SELL' and float(last.High)>=stop: exit_price=stop; reason='Stop-loss'
+            elif side=='SELL' and float(last.High)>=stop: exit_price=stop; reason='Trailing/initial stop-loss'
             elif side=='SELL' and float(last.Low)<=target: exit_price=target; reason='Target'
             if exit_price is not None:
                 pnl=(exit_price-entry)*qty*(1 if side=='BUY' else -1)
-                c.execute('UPDATE trades SET status="CLOSED",exit=?,closed=?,pnl=?,reason=? WHERE id=?',(exit_price,now,pnl,now+' '+reason,tid)); c.commit()
+                c.execute('UPDATE trades SET status="CLOSED",exit=?,closed=?,pnl=?,reason=?,last_bar=? WHERE id=?',(exit_price,now,pnl,now+' '+reason,bar_time,tid))
+            else:
+                # One-way trailing: BUY stop can only rise; SELL stop can only fall.
+                if side=='BUY':
+                    candidate=ema9-buffer
+                    new_stop=max(float(stop),candidate) if candidate < float(last.Close) else float(stop)
+                else:
+                    candidate=ema9+buffer
+                    new_stop=min(float(stop),candidate) if candidate > float(last.Close) else float(stop)
+                c.execute('UPDATE trades SET stop=?,last_bar=? WHERE id=?',(new_stop,bar_time,tid))
+            c.commit()
         if sig and not halted:
             # avoid duplicate entry on same latest bar and same symbol; max active positions enforced
             bar_time=str(df.index[-1]); dup=c.execute('SELECT 1 FROM signals WHERE symbol=? AND side=? AND time=?',(sym,sig['side'],bar_time)).fetchone()
@@ -93,13 +116,13 @@ def scan(symbols, capital_risk, max_positions, max_trades, daily_profit, daily_l
                 qty=int(capital_risk/risk_per_share) if risk_per_share>0 else 0
                 if qty>0:
                     target=sig['price']+2.5*risk_per_share if sig['side']=='BUY' else sig['price']-2.5*risk_per_share
-                    c.execute('INSERT INTO trades(symbol,side,entry,stop,target,qty,opened,status,reason) VALUES(?,?,?,?,?,?,?,"OPEN",?)',(sym,sig['side'],sig['price'],sig['stop'],target,qty,now,sig['reason']))
+                    c.execute('INSERT INTO trades(symbol,side,entry,stop,target,qty,opened,status,reason,last_bar) VALUES(?,?,?,?,?,?,?,"OPEN",?,?)',(sym,sig['side'],sig['price'],sig['stop'],target,qty,now,sig['reason'],bar_time))
                     c.execute('INSERT OR IGNORE INTO signals(symbol,side,price,time,reason) VALUES(?,?,?,?,?)',(sym,sig['side'],sig['price'],bar_time,sig['reason'])); c.commit(); fresh.append(f"{sym} {sig['side']} @ {sig['price']:.2f}"); n_today+=1
     c.close(); return pd.DataFrame(status),fresh
 
 st.set_page_config(page_title='SmartStock V3 — No API Key',page_icon='📈',layout='wide')
-st.title('📈 SmartStock V3 — Automatic Paper Trading')
-st.caption('Public Yahoo Finance data • No Angel One API key • Paper trades only')
+st.title('📈 SmartStock V4 — 9 EMA Trailing Paper Trading')
+st.caption('Public Yahoo Finance data • 9 EMA one-way trailing SL • No Angel One API key • Paper trades only')
 with st.sidebar:
     st.header('Scanner settings')
     refresh=st.slider('Refresh interval (seconds)',30,300,60,step=30)
@@ -140,4 +163,4 @@ with t2:
                     ex=float(pxrow.iloc[0]['Last price']); pnl=(ex-entry)*qty*(1 if side=='BUY' else -1); c.execute('UPDATE trades SET status="CLOSED",exit=?,closed=?,pnl=?,reason=? WHERE id=?',(ex,datetime.now().isoformat(timespec='seconds'),pnl,'Manual close',id_)); c.commit(); st.success(f'Closed at {ex:.2f}, P&L ₹{pnl:.2f}'); st.rerun()
 with t3: st.dataframe(alltrades,use_container_width=True,hide_index=True)
 c.close()
-st.caption('Strategy signals are experimental and can lose money even in simulation. Public-source prices are not guaranteed real-time. No real orders are sent.')
+st.caption('V4: Trailing SL is recalculated after each newly completed 5-minute candle: BUY = 9 EMA − 0.10% buffer (only moves up); SELL = 9 EMA + 0.10% buffer (only moves down). The updated stop applies from the next completed candle. Strategy signals are experimental; public-source prices may be delayed. No real orders are sent.')
